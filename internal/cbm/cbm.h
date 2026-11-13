@@ -1369,6 +1369,10 @@ uint32_t cbm_source_line_count(const char *src, int src_len);
 // codebases). Default ON. Set before extraction; read-only during.
 void cbm_set_macro_extraction(int enabled);
 int cbm_macro_extraction_enabled(void);
+/* PDG (CFG/CDG/REACHING_DEF) extraction gate — set by the pipeline from the
+ * index mode (full/advanced), mirrors cbm_set_macro_extraction. */
+void cbm_set_pdg_extraction(int enabled);
+int cbm_pdg_extraction_enabled(void);
 
 // --- Internal helpers used by extractors ---
 

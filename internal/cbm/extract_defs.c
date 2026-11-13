@@ -233,6 +233,8 @@ static TSNode find_class_body(TSNode class_node, CBMLanguage lang);
 static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *class_qn);
 static void extract_record_accessors(CBMExtractCtx *ctx, TSNode node, const char *class_qn);
 static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
+/* OpenACS Tcl: emit a Function def for `ad_proc name {args} {doc} {body}` commands. */
+static void extract_tcl_ad_proc(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 
 // --- Helpers ---
 
@@ -10285,6 +10287,85 @@ static TSNode emit_elixir_module_class(CBMExtractCtx *ctx, TSNode cur) {
 
 // Process Elixir call nodes iteratively — handles defmodule/def/defp/defmacro
 // without recursion between extract_elixir_call ↔ extract_elixir_module_def.
+/* OpenACS Tcl: `ad_proc name {args} {doc} {body}` is the OpenACS/AOLServer
+ * proc-definition command (94%+ of procs in OpenACS codebases use it instead of
+ * plain `proc`). tree-sitter-tcl parses it as a generic `command` node
+ * (name field = "ad_proc", arguments = word_list), so it never reaches the
+ * `procedure` func-type path and, without this hook, every ad_proc definition
+ * site would only surface as a phantom CALL to "ad_proc".
+ *
+ * The proc name is the first simple_word in the word_list that is not an
+ * ad_proc flag (-public/-private/-deprecated/-warn/-debug), mirroring the
+ * OpenACS flag convention. The whole command node is the def span, so the
+ * params/doc/body braces fall inside the definition's line range. */
+static void extract_tcl_ad_proc(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
+    (void)spec;
+    TSNode cmd_name = ts_node_child_by_field_name(node, TS_FIELD("name"));
+    if (ts_node_is_null(cmd_name)) {
+        return;
+    }
+    CBMArena *a = ctx->arena;
+    char *cmd = cbm_node_text(a, cmd_name, ctx->source);
+    if (!cmd || strcmp(cmd, "ad_proc") != 0) {
+        return;
+    }
+
+    TSNode wl = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+    if (ts_node_is_null(wl)) {
+        return;
+    }
+
+    static const char *ad_proc_flags[] = {"-public", "-private", "-deprecated",
+                                          "-warn", "-debug", NULL};
+    TSNode name_node = (TSNode){0};
+    uint32_t wc = ts_node_child_count(wl);
+    for (uint32_t i = 0; i < wc; i++) {
+        TSNode w = ts_node_child(wl, i);
+        if (strcmp(ts_node_type(w), "simple_word") != 0) {
+            continue;
+        }
+        char *txt = cbm_node_text(a, w, ctx->source);
+        if (!txt || !txt[0]) {
+            continue;
+        }
+        bool is_flag = false;
+        for (const char **f = ad_proc_flags; *f; f++) {
+            if (strcmp(txt, *f) == 0) {
+                is_flag = true;
+                break;
+            }
+        }
+        if (!is_flag) {
+            name_node = w;
+            break;
+        }
+    }
+    if (ts_node_is_null(name_node)) {
+        return;
+    }
+    char *name = cbm_node_text(a, name_node, ctx->source);
+    if (!name || !name[0]) {
+        return;
+    }
+
+    const char *qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    uint32_t start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
+    uint32_t end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+
+    CBMDefinition def;
+    memset(&def, 0, sizeof(def));
+    def.name = name;
+    def.qualified_name = qn;
+    def.label = "Function";
+    def.file_path = ctx->rel_path;
+    def.start_line = start_line;
+    def.end_line = end_line;
+    def.lines = (int)(end_line - start_line + TS_LINE_OFFSET);
+    def.is_exported = true; /* Tcl procs are global by default */
+    compute_fingerprint(ctx, &def, node);
+    cbm_defs_push(&ctx->result->defs, a, def);
+}
+
 static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     (void)spec;
     /* Module body the last extracted clause was written in; see
@@ -13746,6 +13827,16 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
 
         if (ctx->language == CBM_LANG_ELIXIR && strcmp(kind, "call") == 0) {
             extract_elixir_call(ctx, node, spec);
+            continue;
+        }
+
+        /* OpenACS Tcl: ad_proc commands are proc definitions, not calls. The
+         * handler no-ops for any command whose first word is not ad_proc; push
+         * children so nested commands (calls inside proc bodies, nested procs)
+         * are still traversed. */
+        if (ctx->language == CBM_LANG_TCL && strcmp(kind, "command") == 0) {
+            extract_tcl_ad_proc(ctx, node, spec);
+            wd_push_children_reverse(&s, node, frame.enclosing_class_qn);
             continue;
         }
 

@@ -301,6 +301,16 @@ bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     case CBM_LANG_PUPPET:
         keywords = puppet_keywords;
         break;
+    case CBM_LANG_TCL:
+        /* OpenACS: `ad_proc` is a proc-DEFINITION command (ad_proc name {args}
+         * {doc} {body}); a command node whose first word is `ad_proc` must not
+         * mint a CALL edge to a phantom "ad_proc" symbol. Everything else keeps
+         * the generic set (if/while/foreach/... stay suppressed as before). */
+        if (strcmp(name, "ad_proc") == 0) {
+            return true;
+        }
+        keywords = generic_keywords;
+        break;
     case CBM_LANG_SWIFT:
         /* `init` and `deinit` are Swift keywords. A reference to one
          * (`.init(...)`, `Foo.init`) names an initializer of a type the bare

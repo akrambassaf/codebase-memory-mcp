@@ -68,6 +68,16 @@ int cbm_macro_extraction_enabled(void) {
     return atomic_load_explicit(&g_extract_macros, memory_order_relaxed);
 }
 
+/* PDG gate: default ON for direct callers/tests, set by the pipeline from the
+ * index mode before extraction — same contract as g_extract_macros. */
+static _Atomic int g_extract_pdg = 1;
+void cbm_set_pdg_extraction(int enabled) {
+    atomic_store_explicit(&g_extract_pdg, enabled ? 1 : 0, memory_order_relaxed);
+}
+int cbm_pdg_extraction_enabled(void) {
+    return atomic_load_explicit(&g_extract_pdg, memory_order_relaxed);
+}
+
 #define NSEC_PER_SEC 1000000000ULL
 #define USEC_TO_NSEC 1000ULL
 /* Use compat.h's cbm_clock_gettime which accepts CLOCK_MONOTONIC (value

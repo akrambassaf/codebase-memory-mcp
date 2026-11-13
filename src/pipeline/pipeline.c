@@ -4301,6 +4301,18 @@ static int run_tests_and_history(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
 static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                const cbm_file_info_t *files, int file_count,
                                const cbm_file_hash_t *baseline_manifest, int baseline_count) {
+    /* PDG layers (BasicBlock + CFG/CDG/REACHING_DEF) re-parse Tcl files
+     * themselves, so they run once here for BOTH the parallel and sequential
+     * extraction paths — after extraction, before the predump passes. */
+    struct timespec tpdg;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &tpdg);
+    int pdg_rc = cbm_pipeline_pass_pdg(ctx, files, file_count);
+    if (pdg_rc != 0 && pdg_rc != CBM_PIPELINE_ABORT_PRESERVE_DB) {
+        return pdg_rc;
+    }
+    cbm_log_info("pass.timing", "pass", "pdg", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(tpdg)));
+
     int rc = run_tests_and_history(p, ctx, files, file_count);
     if (rc != 0) {
         return rc;
@@ -4411,6 +4423,10 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
      * (≈49% of nodes on the Linux kernel), so gate them to full mode — moderate
      * and fast skip them entirely. Set before any extraction dispatch. */
     cbm_set_macro_extraction(p->mode == CBM_MODE_FULL);
+
+    /* PDG layers (BasicBlock + CFG/CDG/REACHING_DEF) multiply edges, so gate
+     * them to full mode the same way macro extraction is gated. */
+    cbm_set_pdg_extraction(p->mode == CBM_MODE_FULL);
 
     /* One project read supplies extensions, declarations and manifest digest.
      * Snapshot ownership extends through the outer publication guard. */

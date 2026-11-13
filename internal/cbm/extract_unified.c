@@ -684,6 +684,54 @@ static bool lisp_head_is_def(const char *t) {
     return false;
 }
 
+/* Resolve a Tcl ad_proc command's QN for scope tracking. The def node is a
+ * `command` whose name field is `ad_proc`; the proc name is the first
+ * simple_word in the arguments word_list that is not an ad_proc flag
+ * (-public/-private/-deprecated/-warn/-debug). Returns NULL for any other
+ * command so push_boundary_scopes pushes no scope for plain in-body calls.
+ * Mirrors extract_tcl_ad_proc() in extract_defs.c. */
+static const char *compute_tcl_func_qn(CBMExtractCtx *ctx, TSNode node) {
+    if (strcmp(ts_node_type(node), "command") != 0) {
+        return NULL;
+    }
+    TSNode cmd_name = ts_node_child_by_field_name(node, TS_FIELD("name"));
+    if (ts_node_is_null(cmd_name)) {
+        return NULL;
+    }
+    char *cmd = cbm_node_text(ctx->arena, cmd_name, ctx->source);
+    if (!cmd || strcmp(cmd, "ad_proc") != 0) {
+        return NULL;
+    }
+    TSNode wl = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+    if (ts_node_is_null(wl)) {
+        return NULL;
+    }
+    static const char *ad_proc_flags[] = {"-public", "-private", "-deprecated",
+                                          "-warn", "-debug", NULL};
+    uint32_t wc = ts_node_child_count(wl);
+    for (uint32_t i = 0; i < wc; i++) {
+        TSNode w = ts_node_child(wl, i);
+        if (strcmp(ts_node_type(w), "simple_word") != 0) {
+            continue;
+        }
+        char *txt = cbm_node_text(ctx->arena, w, ctx->source);
+        if (!txt || !txt[0]) {
+            continue;
+        }
+        bool is_flag = false;
+        for (const char **f = ad_proc_flags; *f; f++) {
+            if (strcmp(txt, *f) == 0) {
+                is_flag = true;
+                break;
+            }
+        }
+        if (!is_flag) {
+            return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, txt);
+        }
+    }
+    return NULL;
+}
+
 /* Resolve a Lisp (Clojure/Scheme/Racket) def-form's QN for scope tracking.
  * The def node is a list/list_lit whose head names the def kind and whose
  * second element is the name (a bare symbol) or a (name args...) nested list.
@@ -1177,6 +1225,12 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
      * Gate on the def-macro target text so only definitions push a scope. */
     if (ctx->language == CBM_LANG_ELIXIR) {
         return compute_elixir_func_qn(ctx, node);
+    }
+
+    /* OpenACS Tcl: ad_proc procs are `command` nodes (so is every in-body
+     * call). Gate on the first word so only definitions push a scope. */
+    if (ctx->language == CBM_LANG_TCL) {
+        return compute_tcl_func_qn(ctx, node);
     }
 
     /* Objective-C: a method_definition's selector keyword is a plain `identifier`
@@ -2857,6 +2911,15 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
                     }
                 }
             }
+        }
+    } else if (ctx->language == CBM_LANG_TCL && strcmp(ts_node_type(node), "command") == 0) {
+        /* OpenACS Tcl: ad_proc commands are proc definitions, so their body's
+         * in-body calls must source to the Function, not the Module. Only
+         * ad_proc commands yield a QN (compute_tcl_func_qn gates on the first
+         * word); plain commands push no scope. */
+        const char *fqn = compute_func_qn(ctx, node, spec, state);
+        if (fqn) {
+            push_function_scope(state, depth, fqn, node);
         }
     } else if (cbm_is_namespace_scope_kind(ctx->language, ts_node_type(node))) {
         const char *namespace_qn = compute_class_qn(ctx, node, state);

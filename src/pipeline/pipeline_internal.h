@@ -1291,6 +1291,9 @@ void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb);
 
 int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                   int file_count);
+/* Implemented in pass_pdg.c: CFG/CDG/REACHING_DEF layers (opt-in, full mode). */
+int cbm_pipeline_pass_pdg(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                          int file_count);
 
 int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
 
