@@ -197,6 +197,40 @@ typedef enum {
 
 static st_kind_t pdg_classify(pdg_fn_t *f, TSNode n) {
     const char *t = ts_node_type(n);
+    if (f->lang == CBM_LANG_PHP) {
+        if (strcmp(t, "expression_statement") == 0) {
+            TSNode inner = ts_node_named_child(n, 0);
+            if (!ts_node_is_null(inner)) {
+                const char *it = ts_node_type(inner);
+                if (strcmp(it, "assignment_expression") == 0 ||
+                    strcmp(it, "augmented_assignment_expression") == 0 ||
+                    strcmp(it, "update_expression") == 0) {
+                    return ST_SET;
+                }
+            }
+            return ST_PLAIN;
+        }
+        if (strcmp(t, "if_statement") == 0) {
+            return ST_IF;
+        }
+        if (strcmp(t, "while_statement") == 0 || strcmp(t, "for_statement") == 0 ||
+            strcmp(t, "foreach_statement") == 0 || strcmp(t, "do_statement") == 0) {
+            return ST_WHILE;
+        }
+        if (strcmp(t, "try_statement") == 0) {
+            return ST_TRY;
+        }
+        if (strcmp(t, "return_statement") == 0 || strcmp(t, "break_statement") == 0 ||
+            strcmp(t, "continue_statement") == 0 || strcmp(t, "throw_statement") == 0) {
+            return ST_TERM;
+        }
+        if (strcmp(t, "assignment_expression") == 0 ||
+            strcmp(t, "augmented_assignment_expression") == 0 ||
+            strcmp(t, "update_expression") == 0) {
+            return ST_SET;
+        }
+        return ST_PLAIN;
+    }
     if (f->lang == CBM_LANG_PYTHON) {
         /* In a Python suite, assignments are wrapped in expression_statement
          * nodes. Unwrap so def sites are classified as ST_SET. */
@@ -260,6 +294,22 @@ static st_kind_t pdg_classify(pdg_fn_t *f, TSNode n) {
 
 static bool pdg_is_stmt_node(const pdg_fn_t *f, TSNode n) {
     const char *t = ts_node_type(n);
+    if (f->lang == CBM_LANG_PHP) {
+        return strcmp(t, "expression_statement") == 0 ||
+               strcmp(t, "assignment_expression") == 0 ||
+               strcmp(t, "augmented_assignment_expression") == 0 ||
+               strcmp(t, "update_expression") == 0 || strcmp(t, "if_statement") == 0 ||
+               strcmp(t, "while_statement") == 0 || strcmp(t, "for_statement") == 0 ||
+               strcmp(t, "foreach_statement") == 0 || strcmp(t, "do_statement") == 0 ||
+               strcmp(t, "switch_statement") == 0 || strcmp(t, "try_statement") == 0 ||
+               strcmp(t, "return_statement") == 0 || strcmp(t, "break_statement") == 0 ||
+               strcmp(t, "continue_statement") == 0 || strcmp(t, "throw_statement") == 0 ||
+               strcmp(t, "echo_statement") == 0 || strcmp(t, "global_declaration") == 0 ||
+               strcmp(t, "static_variable_declaration") == 0 ||
+               strcmp(t, "unset_statement") == 0 || strcmp(t, "goto_statement") == 0 ||
+               strcmp(t, "function_definition") == 0 || strcmp(t, "method_declaration") == 0 ||
+               strcmp(t, "class_declaration") == 0 || strcmp(t, "interface_declaration") == 0;
+    }
     if (f->lang == CBM_LANG_PYTHON) {
         /* block children of a Python suite. Decorated/nested defs are PLAIN
          * statements (their own PDG is built separately by the def walk). */
@@ -289,6 +339,15 @@ static TSNode pdg_def_body(pdg_fn_t *f, TSNode def) {
     /* Python: function_definition -> body field (a block) */
     if (f->lang == CBM_LANG_PYTHON) {
         return ts_node_child_by_field_name(def, TS_FIELD("body"));
+    }
+    /* PHP: function_definition / method_declaration -> body field
+     * (compound_statement); fallback to the last compound_statement child. */
+    if (f->lang == CBM_LANG_PHP) {
+        TSNode body = ts_node_child_by_field_name(def, TS_FIELD("body"));
+        if (!ts_node_is_null(body)) {
+            return body;
+        }
+        return cbm_find_child_by_kind(def, "compound_statement");
     }
     /* Tcl: procedure -> body field; ad_proc -> last word of arguments */
     TSNode body = ts_node_child_by_field_name(def, TS_FIELD("body"));
@@ -410,9 +469,122 @@ static void pdg_py_collect_defs(pdg_fn_t *f, int bb, TSNode node) {
     }
 }
 
+/* PHP: collect `$name` variable_name texts (minus the $) into the use set,
+ * skipping identifiers under assignment/augmented_assignment LEFT fields. */
+static void pdg_php_collect_ids(pdg_fn_t *f, int bb, TSNode root, bool under_left) {
+    pdg_bb_t *b = &f->bbs[bb];
+    TSNode stack[64];
+    bool flags[64];
+    int top = 0;
+    stack[top] = root;
+    flags[top++] = under_left;
+    while (top > 0 && b->use_vars_n < CBM_PDG_MAX_RD_VARS) {
+        TSNode cur = stack[--top];
+        bool ul = flags[top];
+        const char *ct = ts_node_type(cur);
+        if (strcmp(ct, "variable_name") == 0 && !ul) {
+            char *v = pdg_text(f, cur);
+            if (v && v[0] == '$' && b->use_vars_n < CBM_PDG_MAX_RD_VARS) {
+                bool dup = false;
+                for (int j = 0; j < b->use_vars_n; j++) {
+                    if (strcmp(b->use_vars[j], v + 1) == 0) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    b->use_vars[b->use_vars_n++] = v + 1;
+                }
+            }
+        }
+        uint32_t cc = ts_node_child_count(cur);
+        for (uint32_t i = 0; i < cc && top < (int)(sizeof(stack) / sizeof(stack[0])); i++) {
+            TSNode c = ts_node_child(cur, i);
+            bool child_left = ul;
+            if (!child_left &&
+                (strcmp(ct, "assignment_expression") == 0 ||
+                 strcmp(ct, "augmented_assignment_expression") == 0)) {
+                TSNode lf = ts_node_child_by_field_name(cur, TS_FIELD("left"));
+                child_left = !ts_node_is_null(lf) &&
+                             ts_node_start_byte(lf) == ts_node_start_byte(c) &&
+                             ts_node_end_byte(lf) == ts_node_end_byte(c);
+            }
+            stack[top] = c;
+            flags[top++] = child_left;
+        }
+    }
+}
+
+/* PHP: add variable_name names under `node` as DEF sites. */
+static void pdg_php_collect_defs(pdg_fn_t *f, int bb, TSNode node) {
+    pdg_bb_t *b = &f->bbs[bb];
+    TSNode stack[64];
+    int top = 0;
+    stack[top++] = node;
+    while (top > 0 && b->set_vars_n < CBM_PDG_MAX_RD_VARS) {
+        TSNode cur = stack[--top];
+        if (strcmp(ts_node_type(cur), "variable_name") == 0) {
+            char *v = pdg_text(f, cur);
+            if (v && v[0] == '$' && b->set_vars_n < CBM_PDG_MAX_RD_VARS) {
+                b->set_vars[b->set_vars_n++] = v + 1;
+            }
+            continue;
+        }
+        uint32_t cc = ts_node_child_count(cur);
+        for (uint32_t i = 0; i < cc && top < (int)(sizeof(stack) / sizeof(stack[0])); i++) {
+            stack[top++] = ts_node_child(cur, i);
+        }
+    }
+}
+
 static void pdg_collect_facts(pdg_fn_t *f, int bb, TSNode n) {
     pdg_bb_t *b = &f->bbs[bb];
     const char *t = ts_node_type(n);
+    if (f->lang == CBM_LANG_PHP) {
+        /* unwrap expression_statement → assignment/update expression */
+        if (strcmp(t, "expression_statement") == 0) {
+            TSNode inner = ts_node_named_child(n, 0);
+            if (!ts_node_is_null(inner)) {
+                const char *it = ts_node_type(inner);
+                if (strcmp(it, "assignment_expression") == 0 ||
+                    strcmp(it, "augmented_assignment_expression") == 0 ||
+                    strcmp(it, "update_expression") == 0) {
+                    n = inner;
+                    t = it;
+                }
+            }
+        }
+        if (strcmp(t, "assignment_expression") == 0) {
+            TSNode left = ts_node_child_by_field_name(n, TS_FIELD("left"));
+            TSNode right = ts_node_child_by_field_name(n, TS_FIELD("right"));
+            if (!ts_node_is_null(left)) {
+                pdg_php_collect_defs(f, bb, left);
+            }
+            if (!ts_node_is_null(right)) {
+                pdg_php_collect_ids(f, bb, right, false);
+            }
+        } else if (strcmp(t, "augmented_assignment_expression") == 0) {
+            TSNode left = ts_node_child_by_field_name(n, TS_FIELD("left"));
+            TSNode right = ts_node_child_by_field_name(n, TS_FIELD("right"));
+            if (!ts_node_is_null(left)) {
+                pdg_php_collect_defs(f, bb, left);
+                pdg_php_collect_ids(f, bb, left, false); /* $x += 1 reads $x too */
+            }
+            if (!ts_node_is_null(right)) {
+                pdg_php_collect_ids(f, bb, right, false);
+            }
+        } else if (strcmp(t, "update_expression") == 0) {
+            /* $x++ / ++$x: argument is a variable_name, def + use */
+            TSNode arg = ts_node_child_by_field_name(n, TS_FIELD("argument"));
+            if (!ts_node_is_null(arg)) {
+                pdg_php_collect_defs(f, bb, arg);
+                pdg_php_collect_ids(f, bb, arg, false);
+            }
+        } else {
+            pdg_php_collect_ids(f, bb, n, false);
+        }
+        return;
+    }
     if (f->lang == CBM_LANG_PYTHON) {
         /* unwrap expression_statement → assignment */
         if (strcmp(t, "expression_statement") == 0) {
@@ -518,6 +690,10 @@ static void pdg_collect_facts(pdg_fn_t *f, int bb, TSNode n) {
 /* Collect uses in a condition word (branch predicates). */
 static void pdg_collect_cond_uses(pdg_fn_t *f, int bb, TSNode cond_word) {
     pdg_bb_t *b = &f->bbs[bb];
+    if (f->lang == CBM_LANG_PHP) {
+        pdg_php_collect_ids(f, bb, cond_word, false);
+        return;
+    }
     if (f->lang == CBM_LANG_PYTHON) {
         pdg_py_collect_ids(f, bb, cond_word, false);
         return;
@@ -572,6 +748,14 @@ static TSNode pdg_loop_cond(pdg_fn_t *f, TSNode n) {
     if (f->lang == CBM_LANG_PYTHON) {
         return ts_node_child_by_field_name(n, TS_FIELD("right"));
     }
+    if (f->lang == CBM_LANG_PHP) {
+        /* PHP foreach/for: the iterable is typically the second named child of
+         * the header; approximate with the second named child. */
+        uint32_t ncc = ts_node_named_child_count(n);
+        if (ncc >= 2) {
+            return ts_node_named_child(n, 1);
+        }
+    }
     TSNode null_node = {0};
     return null_node;
 }
@@ -583,6 +767,10 @@ static TSNode pdg_loop_body(pdg_fn_t *f, TSNode n) {
     cons = ts_node_child_by_field_name(n, TS_FIELD("body"));
     if (!ts_node_is_null(cons)) {
         return cons;
+    }
+    if (f->lang == CBM_LANG_PHP) {
+        /* PHP loop bodies are compound_statement children */
+        return cbm_find_child_by_kind(n, "compound_statement");
     }
     if (f->lang == CBM_LANG_PYTHON) {
         TSNode null_node = {0};
@@ -626,18 +814,22 @@ static int pdg_build_if(pdg_fn_t *f, TSNode if_node, int cur) {
     TSNode cons = ts_node_child_by_field_name(if_node, TS_FIELD("consequence"));
     TSNode alt = ts_node_child_by_field_name(if_node, TS_FIELD("alternative"));
     /* Else arm can be a direct CHILD node when the `alternative` field is
-     * null: Tcl `else`, Python `else_clause`. Its body is the child's first
-     * word/braced child (Tcl) or its `body` field (Python). */
+     * null: Tcl `else`, Python `else_clause`, PHP `else_clause`. */
     if (ts_node_is_null(alt)) {
-        const char *else_t = (f->lang == CBM_LANG_PYTHON) ? "else_clause" : "else";
+        const char *else_t = (f->lang == CBM_LANG_PYTHON || f->lang == CBM_LANG_PHP)
+                                 ? "else_clause"
+                                 : "else";
         uint32_t icc0 = ts_node_child_count(if_node);
         for (uint32_t i = 0; i < icc0; i++) {
             TSNode c = ts_node_child(if_node, i);
             if (strcmp(ts_node_type(c), else_t) != 0) {
                 continue;
             }
-            if (f->lang == CBM_LANG_PYTHON) {
+            if (f->lang == CBM_LANG_PYTHON || f->lang == CBM_LANG_PHP) {
                 alt = ts_node_child_by_field_name(c, TS_FIELD("body"));
+                if (ts_node_is_null(alt)) {
+                    alt = cbm_find_child_by_kind(c, "compound_statement");
+                }
                 break;
             }
             uint32_t ecc = ts_node_child_count(c);
@@ -690,8 +882,10 @@ static int pdg_build_if(pdg_fn_t *f, TSNode if_node, int cur) {
         tails[tails_n++] = cond_bb;
     }
 
-    /* elseif chain: Tcl children of type `elseif`, Python `elif_clause` */
-    const char *elif_t = (f->lang == CBM_LANG_PYTHON) ? "elif_clause" : "elseif";
+    /* elseif chain: Tcl `elseif`, Python `elif_clause`, PHP `else_if_clause` */
+    const char *elif_t = (f->lang == CBM_LANG_PYTHON)   ? "elif_clause"
+                         : (f->lang == CBM_LANG_PHP) ? "else_if_clause"
+                                                     : "elseif";
     uint32_t icc = ts_node_child_count(if_node);
     for (uint32_t i = 0; i < icc; i++) {
         TSNode c = ts_node_child(if_node, i);
@@ -807,7 +1001,18 @@ static int pdg_build_try(pdg_fn_t *f, TSNode n, int cur) {
         TSNode c = ts_node_child(n, i);
         const char *t = ts_node_type(c);
         TSNode body = {0};
-        if (f->lang == CBM_LANG_PYTHON) {
+        if (f->lang == CBM_LANG_PHP) {
+            /* PHP try_statement: body compound_statement, then each
+             * catch_clause body, then finally_clause body. */
+            if (strcmp(t, "compound_statement") == 0) {
+                body = c;
+            } else if (strcmp(t, "catch_clause") == 0 || strcmp(t, "finally_clause") == 0) {
+                body = ts_node_child_by_field_name(c, TS_FIELD("body"));
+                if (ts_node_is_null(body)) {
+                    body = cbm_find_child_by_kind(c, "compound_statement");
+                }
+            }
+        } else if (f->lang == CBM_LANG_PYTHON) {
             /* try_statement: chain its block children in order — the try body
              * block, then each except_clause's block, else, finally. */
             if (strcmp(t, "block") == 0) {
@@ -887,7 +1092,7 @@ static pdg_region_t pdg_build_region(pdg_fn_t *f, TSNode *stmts, int n, int exit
             char *w = pdg_head_word(f, st);
             bool is_break = false;
             bool is_continue = false;
-            if (f->lang == CBM_LANG_PYTHON) {
+            if (f->lang == CBM_LANG_PYTHON || f->lang == CBM_LANG_PHP) {
                 const char *tst = ts_node_type(st);
                 is_break = strcmp(tst, "break_statement") == 0;
                 is_continue = strcmp(tst, "continue_statement") == 0;
@@ -917,6 +1122,17 @@ static pdg_region_t pdg_build_region(pdg_fn_t *f, TSNode *stmts, int n, int exit
             const char *lname = "loop";
             if (f->lang == CBM_LANG_PYTHON) {
                 lname = strcmp(ts_node_type(st), "for_statement") == 0 ? "for" : "while";
+            } else if (f->lang == CBM_LANG_PHP) {
+                const char *pt = ts_node_type(st);
+                if (strcmp(pt, "while_statement") == 0) {
+                    lname = "while";
+                } else if (strcmp(pt, "for_statement") == 0) {
+                    lname = "for";
+                } else if (strcmp(pt, "foreach_statement") == 0) {
+                    lname = "foreach";
+                } else if (strcmp(pt, "do_statement") == 0) {
+                    lname = "do";
+                }
             } else {
                 char *w = pdg_head_word(f, st);
                 if (w) {
@@ -1257,7 +1473,10 @@ static void pdg_walk_defs(cbm_gbuf_t *gb, pdg_fn_t *f, TSNode root) {
         TSNode cur = stack[--top];
         const char *t = ts_node_type(cur);
         bool is_def = false;
-        if (f->lang == CBM_LANG_PYTHON) {
+        if (f->lang == CBM_LANG_PHP) {
+            is_def = strcmp(t, "function_definition") == 0 ||
+                     strcmp(t, "method_declaration") == 0;
+        } else if (f->lang == CBM_LANG_PYTHON) {
             is_def = strcmp(t, "function_definition") == 0;
         } else {
             is_def = strcmp(t, "procedure") == 0;
@@ -1267,12 +1486,13 @@ static void pdg_walk_defs(cbm_gbuf_t *gb, pdg_fn_t *f, TSNode root) {
             }
         }
         if (is_def) {
-            /* name: Python function_definition -> name field; Tcl procedure ->
-             * name field; Tcl ad_proc -> first non-flag word of the arguments
+            /* name: PHP/Python defs -> name field; Tcl procedure -> name
+             * field; Tcl ad_proc -> first non-flag word of the arguments
              * word_list (the command's own name field is the literal
              * "ad_proc"). */
             char *name = NULL;
-            if (f->lang == CBM_LANG_PYTHON || strcmp(t, "procedure") == 0) {
+            if (f->lang == CBM_LANG_PYTHON || f->lang == CBM_LANG_PHP ||
+                strcmp(t, "procedure") == 0) {
                 TSNode name_node = ts_node_child_by_field_name(cur, TS_FIELD("name"));
                 if (!ts_node_is_null(name_node)) {
                     name = pdg_text(f, name_node);
@@ -1384,7 +1604,7 @@ int cbm_pipeline_pass_pdg(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
 
     for (int i = 0; i < file_count; i++) {
         CBMLanguage lang = files[i].language;
-        if (lang != CBM_LANG_TCL && lang != CBM_LANG_PYTHON) {
+        if (lang != CBM_LANG_TCL && lang != CBM_LANG_PYTHON && lang != CBM_LANG_PHP) {
             continue; /* other languages are a follow-up */
         }
         if (lang != parser_lang) {
